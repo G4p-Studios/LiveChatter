@@ -4,7 +4,7 @@ chat-downloader
 accessible-output2
 sound_lib
 openai
-google-genai
 google-cloud-texttospeech
 boto3
 elevenlabs
+requests

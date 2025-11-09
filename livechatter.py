@@ -4,7 +4,7 @@ LiveChatter - YouTube Live Chat Reader & Summarizer
 LiveChatter is a PyQt6 application that:
 - Reads live YouTube chat (pytchat; optional chat-downloader fallback)
 - Two chat modes: "Standard (read messages)" and "Summaries (periodic AI summaries)"
-- Summary providers: OpenAI / Gemini
+- Summary provider: OpenAI
 - TTS options: System (accessible_output2: NVDA/JAWS/SAPI5), OpenAI TTS, Google Cloud TTS, Amazon Polly, ElevenLabs
 - Sound packs via sound_lib (optional)
 - Options dialog for API keys and sound settings
@@ -61,9 +61,9 @@ except Exception:
     openai = None
 
 try:
-    import google_genai as genai
+    import requests
 except Exception:
-    genai = None
+    requests = None
 
 try:
     from google.cloud import texttospeech as gcloud_tts
@@ -99,7 +99,6 @@ CHAT_MODES = [
 
 SUMMARY_PROVIDERS = [
     "OpenAI",
-    "Gemini"
 ]
 
 TTS_OPTIONS = [
@@ -117,7 +116,6 @@ SYSTEM_TTS_ENGINES = [
 
 DEFAULT_CONFIG = {
     "openai_api_key": "",
-    "gemini_api_key": "",
     "google_cloud_tts_api_key": "",
     "aws_access_key_id": "",
     "aws_secret_access_key": "",
@@ -396,20 +394,65 @@ def list_elevenlabs_voices(api_key: str) -> List[tuple[str, str]]:
     except Exception:
         return []
 
-# ----------------- Summarizer (stub/placeholder) -----------------
+# ----------------- Summarizer -----------------
 class Summarizer:
     def __init__(self, cfg: Dict[str, Any]):
         self.cfg = cfg
 
     def summarize(self, messages: List[Dict[str, str]]) -> str:
         if not messages:
-            return "(No messages to summarize)"
-        users = list({m.get("author", "?") for m in messages})
-        texts = [m.get("text", "")[:120] for m in messages[:6]]
-        return (
-            "Summary (stub):\n- Users: " + ", ".join(users[:8]) +
-            "\n- Highlights:\n  - " + "\n  - ".join(texts)
+            return "It's been quiet. No new messages to summarize."
+
+        # Construct the prompt based on the number of messages
+        formatted_chat = "\n".join([f"{m.get('author', 'User')}: {m.get('text', '')}" for m in messages])
+        
+        # Re-introducing the humor to the prompt
+        base_prompt = (
+            "You are a witty and humorous assistant summarizing a YouTube live stream chat. "
+            "Your summary will be read out loud by a text-to-speech engine, so adopt a conversational and slightly comedic tone. "
+            "Be concise and keep your summary to a few sentences."
         )
+
+        if len(messages) < 5:
+            task_prompt = (
+                "The chat is very quiet. Make a brief, funny comment about the silence, "
+                "and then just read out the few messages that have appeared."
+            )
+        else:
+            task_prompt = (
+                "The chat is active. Do not list every message. Instead, capture the main vibe. "
+                "Identify the key topics being discussed, mention any highlights or funny moments, "
+                "and give a general sense of the conversation."
+            )
+        
+        full_prompt = f"{base_prompt}\n\n{task_prompt}\n\nHere are the recent messages:\n{formatted_chat}"
+
+        # Call the appropriate AI provider
+        return self._summarize_with_openai(full_prompt)
+
+    def _summarize_with_openai(self, prompt_text: str) -> str:
+        if not openai:
+            return "(OpenAI library not installed. Please run: pip install openai)"
+        
+        api_key = self.cfg.get("openai_api_key")
+        if not api_key:
+            return "(OpenAI API key is not set in Options)"
+
+        try:
+            client = openai.OpenAI(api_key=api_key)
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a helpful and witty assistant for summarizing YouTube chat."},
+                    {"role": "user", "content": prompt_text}
+                ],
+                temperature=0.7,
+                max_tokens=150,
+            )
+            summary = response.choices[0].message.content
+            return summary.strip() if summary else "(OpenAI returned an empty summary)"
+        except Exception as e:
+            return f"(OpenAI API error: {e})"
 
 # ----------------- Chat Reader Thread -----------------
 class ChatReader(QtCore.QThread):
@@ -423,27 +466,42 @@ class ChatReader(QtCore.QThread):
         self._stop = threading.Event()
 
     def run(self):
-        # Prefer pytchat
+        # Prefer pytchat, with a new auto-reconnect loop
         if pytchat:
-            chat = None
-            try:
-                chat = pytchat.create(video_id=self.video_id, interruptable=False)
-                while chat.is_alive() and not self._stop.is_set():
-                    for c in chat.get().items:
-                        msg = {"author": c.author.name, "text": c.message, "timestamp": c.datetime}
-                        self.message_received.emit(msg)
-                    time.sleep(0.5)
-            except Exception as e:
-                self.error_message.emit(f"YouTube chat reader error (pytchat): {e}")
-            finally:
+            while not self._stop.is_set():
+                chat = None
                 try:
-                    if chat:
-                        chat.terminate()
-                except Exception:
-                    pass
-                self.stopped.emit()
+                    chat = pytchat.create(video_id=self.video_id, interruptable=False)
+                    # Loop while the connection is alive
+                    while chat.is_alive() and not self._stop.is_set():
+                        for c in chat.get().items:
+                            msg = {"author": c.author.name, "text": c.message, "timestamp": c.datetime}
+                            self.message_received.emit(msg)
+                        time.sleep(0.5)
+                    
+                    # If the loop breaks, either we are stopping or the connection was lost.
+                    if self._stop.is_set():
+                        break 
+                    
+                    # Connection lost, try to reconnect after a delay.
+                    self.error_message.emit("Chat connection lost. Reconnecting in 10 seconds...")
+
+                except Exception as e:
+                    self.error_message.emit(f"Chat reader error: {e}. Retrying in 10 seconds...")
+                finally:
+                    try:
+                        if chat:
+                            chat.terminate()
+                    except Exception:
+                        pass
+                
+                # Wait before retrying the connection
                 if not self._stop.is_set():
-                    return
+                    time.sleep(10)
+            
+            self.stopped.emit()
+            return
+
         # Fallback: chat-downloader
         if ChatDownloader:
             try:
@@ -481,10 +539,6 @@ class OptionsDialog(QtWidgets.QDialog):
         self.openai_key = QtWidgets.QLineEdit(self.cfg.get("openai_api_key", ""))
         self.openai_key.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
         layout.addRow("OpenAI API key:", self.openai_key)
-
-        self.gemini_key = QtWidgets.QLineEdit(self.cfg.get("gemini_api_key", ""))
-        self.gemini_key.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
-        layout.addRow("Gemini API key:", self.gemini_key)
 
         self.gcloud_key = QtWidgets.QLineEdit(self.cfg.get("google_cloud_tts_api_key", ""))
         self.gcloud_key.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
@@ -536,7 +590,6 @@ class OptionsDialog(QtWidgets.QDialog):
         newcfg = self.cfg.copy()
         newcfg.update({
             "openai_api_key": self.openai_key.text().strip(),
-            "gemini_api_key": self.gemini_key.text().strip(),
             "google_cloud_tts_api_key": self.gcloud_key.text().strip(),
             "aws_access_key_id": self.aws_key.text().strip(),
             "aws_secret_access_key": self.aws_secret.text().strip(),
@@ -577,14 +630,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chat_mode.setCurrentText(self.cfg.get("chat_mode", CHAT_MODES[0]))
         self.chat_mode.currentTextChanged.connect(self._update_cfg)
         gl.addWidget(QtWidgets.QLabel("Chat mode:"), 1, 0)
-        gl.addWidget(self.chat_mode, 1, 1)
-
-        self.summary_provider = QtWidgets.QComboBox()
-        self.summary_provider.addItems(SUMMARY_PROVIDERS)
-        self.summary_provider.setCurrentText(self.cfg.get("summary_provider", SUMMARY_PROVIDERS[0]))
-        self.summary_provider.currentTextChanged.connect(self._update_cfg)
-        gl.addWidget(QtWidgets.QLabel("Summary provider:"), 1, 2)
-        gl.addWidget(self.summary_provider, 1, 3)
+        # Make the chat mode combo box span the rest of the row
+        gl.addWidget(self.chat_mode, 1, 1, 1, 3)
 
         self.tts_option = QtWidgets.QComboBox()
         self.tts_option.addItems(TTS_OPTIONS)
@@ -697,7 +744,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---- Live settings persistence ----
     def _update_cfg(self, *_):
         self.cfg["chat_mode"] = self.chat_mode.currentText()
-        self.cfg["summary_provider"] = self.summary_provider.currentText()
+        self.cfg["summary_provider"] = "OpenAI" # Hardcoded since it's the only option
         self.cfg["tts_option"] = self.tts_option.currentText()
         self.cfg["summary_interval_minutes"] = int(self.summary_interval.value())
         save_config(self.cfg)
@@ -895,7 +942,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_error(self, err: str):
         self.chat_view.append(f"[Error] {err}")
-        QtWidgets.QMessageBox.warning(self, APP_NAME, err)
+        # Optionally show a non-blocking status message instead of a popup for reconnects
+        if "reconnecting" in err.lower() or "connection lost" in err.lower():
+            self.statusBar().showMessage(err, 5000)
+        else:
+            QtWidgets.QMessageBox.warning(self, APP_NAME, err)
 
     # ---- Quick Summary ----
     def _on_quick_summary(self):
