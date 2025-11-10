@@ -6,7 +6,7 @@ LiveChatter is a PyQt6 application that:
 - Two chat modes: "Standard (read messages)" and "Summaries (periodic AI summaries)"
 - Summary provider: OpenAI
 - TTS options: System (accessible_output2: NVDA/JAWS/SAPI5), OpenAI TTS, Google Cloud TTS, Amazon Polly, ElevenLabs
-- Sound packs via sound_lib (optional)
+- Sound packs via a 'sounds' directory
 - Options dialog for API keys and sound settings
 - Config persisted as JSON in a .livechatter folder under the current working directory
 
@@ -43,6 +43,12 @@ except Exception:
 try:
     from accessible_output2.outputs.auto import Auto as AO2Auto
     from accessible_output2.outputs import sapi5
+    # --- FIX FOR PYINSTALLER: Add dummy imports to find hidden modules ---
+    try:
+        from accessible_output2.outputs import nvda, jaws
+    except ImportError:
+        pass # Fine if not on Windows
+    # -------------------------------------------------------------------
 except Exception:
     AO2Auto = None
     sapi5 = None
@@ -80,17 +86,14 @@ try:
 except Exception:
     elevenlabs = None
 
-try:
-    import sound_lib  # type: ignore
-except Exception:
-    sound_lib = None
-
-from PyQt6 import QtWidgets, QtCore
+from PyQt6 import QtWidgets, QtCore, QtMultimedia
 
 # ----------------- Config & Constants -----------------
 APP_NAME = "LiveChatter"
 CONFIG_DIR = os.path.join(os.getcwd(), ".livechatter")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+SOUND_DIR = os.path.join(os.getcwd(), "sounds")
+
 
 CHAT_MODES = [
     "Standard (read messages)",
@@ -122,7 +125,7 @@ DEFAULT_CONFIG = {
     "aws_region": "us-east-1",
     "elevenlabs_api_key": "",
     "tts_voice": "",  # For SAPI5: voice description; for cloud: provider-specific id
-    "sound_pack_dir": "",
+    "sound_pack": "Default",
     "chat_mode": CHAT_MODES[0],
     "summary_provider": SUMMARY_PROVIDERS[0],
     "tts_option": TTS_OPTIONS[0],
@@ -140,6 +143,7 @@ DEFAULT_CONFIG = {
 # ----------------- Config Helpers -----------------
 def ensure_config_dir():
     os.makedirs(CONFIG_DIR, exist_ok=True)
+    os.makedirs(SOUND_DIR, exist_ok=True)
 
 def load_config() -> Dict[str, Any]:
     ensure_config_dir()
@@ -157,6 +161,47 @@ def save_config(cfg: Dict[str, Any]):
     ensure_config_dir()
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+
+# ----------------- Sound Management -----------------
+def list_sound_packs() -> List[str]:
+    """Scans the sound directory for available packs."""
+    packs = ["None"]
+    if not os.path.isdir(SOUND_DIR):
+        return packs
+    for item in os.listdir(SOUND_DIR):
+        if os.path.isdir(os.path.join(SOUND_DIR, item)):
+            packs.append(item)
+    return packs
+
+class SoundManager:
+    SOUND_FILES = ["chat", "donation", "error", "moderator", "start", "stop", "summary", "verified"]
+
+    def __init__(self, cfg: Dict[str, Any]):
+        self.cfg = cfg
+        self._effects: Dict[str, QtMultimedia.QSoundEffect] = {}
+        self.load_pack()
+
+    def load_pack(self):
+        self._effects = {}
+        pack_name = self.cfg.get("sound_pack", "None")
+        if pack_name == "None":
+            return
+        
+        pack_path = os.path.join(SOUND_DIR, pack_name)
+        if not os.path.isdir(pack_path):
+            return
+        
+        for name in self.SOUND_FILES:
+            sound_path = os.path.join(pack_path, f"{name}.wav")
+            if os.path.exists(sound_path):
+                effect = QtMultimedia.QSoundEffect()
+                effect.setSource(QtCore.QUrl.fromLocalFile(sound_path))
+                self._effects[name] = effect
+
+    def play(self, sound_name: str):
+        if sound_name in self._effects:
+            self._effects[sound_name].play()
+
 
 # ----------------- Utilities -----------------
 def extract_youtube_video_id(url_or_id: str) -> Optional[str]:
@@ -475,15 +520,20 @@ class ChatReader(QtCore.QThread):
                     # Loop while the connection is alive
                     while chat.is_alive() and not self._stop.is_set():
                         for c in chat.get().items:
-                            msg = {"author": c.author.name, "text": c.message, "timestamp": c.datetime}
+                            # Pass more metadata for sound events
+                            msg = {
+                                "author": c.author.name, 
+                                "text": c.message,
+                                "type": c.type, # e.g., 'textMessage', 'superChat'
+                                "is_moderator": c.author.isChatModerator,
+                                "is_verified": c.author.isVerified 
+                            }
                             self.message_received.emit(msg)
                         time.sleep(0.5)
                     
-                    # If the loop breaks, either we are stopping or the connection was lost.
                     if self._stop.is_set():
                         break 
                     
-                    # Connection lost, try to reconnect after a delay.
                     self.error_message.emit("Chat connection lost. Reconnecting in 10 seconds...")
 
                 except Exception as e:
@@ -495,14 +545,13 @@ class ChatReader(QtCore.QThread):
                     except Exception:
                         pass
                 
-                # Wait before retrying the connection
                 if not self._stop.is_set():
                     time.sleep(10)
             
             self.stopped.emit()
             return
 
-        # Fallback: chat-downloader
+        # Fallback: chat-downloader (provides less metadata)
         if ChatDownloader:
             try:
                 url = f"https://www.youtube.com/watch?v={self.video_id}"
@@ -511,7 +560,13 @@ class ChatReader(QtCore.QThread):
                     if self._stop.is_set():
                         break
                     if msg.get("message_type") == "text_message":
-                        m = {"author": msg.get("author", {}).get("name", "?"), "text": msg.get("message", "")}
+                        m = {
+                            "author": msg.get("author", {}).get("name", "?"), 
+                            "text": msg.get("message", ""),
+                            "type": "textMessage",
+                            "is_moderator": False,
+                            "is_verified": False
+                        }
                         self.message_received.emit(m)
                 self.stopped.emit()
             except Exception as e:
@@ -564,15 +619,10 @@ class OptionsDialog(QtWidgets.QDialog):
         self.system_tts_mode.setCurrentText(self.cfg.get("system_tts_backend", SYSTEM_TTS_ENGINES[0]))
         layout.addRow("System TTS engine:", self.system_tts_mode)
 
-        self.sound_dir = QtWidgets.QLineEdit(self.cfg.get("sound_pack_dir", ""))
-        browse_s = QtWidgets.QPushButton("Browse…")
-        hb2 = QtWidgets.QHBoxLayout()
-        hb2.addWidget(self.sound_dir)
-        hb2.addWidget(browse_s)
-        ws = QtWidgets.QWidget()
-        ws.setLayout(hb2)
-        layout.addRow("Sound pack folder:", ws)
-        browse_s.clicked.connect(self._pick_sound_dir)
+        self.sound_pack_combo = QtWidgets.QComboBox()
+        self.sound_pack_combo.addItems(list_sound_packs())
+        self.sound_pack_combo.setCurrentText(self.cfg.get("sound_pack", "Default"))
+        layout.addRow("Sound pack:", self.sound_pack_combo)
 
         btns = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Save | QtWidgets.QDialogButtonBox.StandardButton.Cancel
@@ -580,11 +630,6 @@ class OptionsDialog(QtWidgets.QDialog):
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         layout.addRow(btns)
-
-    def _pick_sound_dir(self):
-        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select sound pack directory")
-        if path:
-            self.sound_dir.setText(path)
 
     def get_updated_config(self) -> Dict[str, Any]:
         newcfg = self.cfg.copy()
@@ -596,7 +641,7 @@ class OptionsDialog(QtWidgets.QDialog):
             "aws_region": self.aws_region.text().strip() or "us-east-1",
             "elevenlabs_api_key": self.eleven_key.text().strip(),
             "tts_voice": self.voice.text().strip(),
-            "sound_pack_dir": self.sound_dir.text().strip(),
+            "sound_pack": self.sound_pack_combo.currentText(),
             "system_tts_backend": self.system_tts_mode.currentText(),
         })
         return newcfg
@@ -610,6 +655,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._restore_window_geometry()
 
         self.tts = TTSManager(self.cfg)
+        self.sound_manager = SoundManager(self.cfg)
         self.summarizer = Summarizer(self.cfg)
         self.pending_messages: List[Dict[str, str]] = []
         self.last_summary_ts = time.time()
@@ -630,7 +676,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chat_mode.setCurrentText(self.cfg.get("chat_mode", CHAT_MODES[0]))
         self.chat_mode.currentTextChanged.connect(self._update_cfg)
         gl.addWidget(QtWidgets.QLabel("Chat mode:"), 1, 0)
-        # Make the chat mode combo box span the rest of the row
         gl.addWidget(self.chat_mode, 1, 1, 1, 3)
 
         self.tts_option = QtWidgets.QComboBox()
@@ -647,7 +692,6 @@ class MainWindow(QtWidgets.QMainWindow):
         gl.addWidget(QtWidgets.QLabel("System TTS engine:"), 2, 2)
         gl.addWidget(self.system_tts_mode, 2, 3)
 
-        # Voice chooser (varies by TTS provider)
         self.voice_combo = QtWidgets.QComboBox()
         self.voice_combo.setToolTip("Choose a voice for the selected TTS provider")
         self.voice_combo.currentTextChanged.connect(self._on_voice_changed)
@@ -676,12 +720,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chat_view.setReadOnly(True)
         gl.addWidget(self.chat_view, 5, 0, 1, 4)
 
-        # Timer for summaries
         self.summary_timer = QtCore.QTimer(self)
         self.summary_timer.timeout.connect(self._maybe_do_summary)
         self.summary_timer.start(5000)
 
-        # Connect buttons
         self.start_btn.clicked.connect(self._on_start)
         self.stop_btn.clicked.connect(self._on_stop)
 
@@ -705,11 +747,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().addPermanentWidget(QtWidgets.QLabel("Msgs:"))
         self.statusBar().addPermanentWidget(self.quick_summary_count_sb)
 
-        # Initial enable states
         self._update_system_tts_enabled()
         self._update_voice_enabled()
 
-    # ---- Persist window geometry ----
     def _restore_window_geometry(self):
         w = int(self.cfg.get("window_w", 900) or 900)
         h = int(self.cfg.get("window_h", 600) or 600)
@@ -741,16 +781,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_window_geometry()
         super().closeEvent(event)
 
-    # ---- Live settings persistence ----
     def _update_cfg(self, *_):
         self.cfg["chat_mode"] = self.chat_mode.currentText()
-        self.cfg["summary_provider"] = "OpenAI" # Hardcoded since it's the only option
+        self.cfg["summary_provider"] = "OpenAI"
         self.cfg["tts_option"] = self.tts_option.currentText()
         self.cfg["summary_interval_minutes"] = int(self.summary_interval.value())
         save_config(self.cfg)
 
     def _on_tts_option_changed(self, txt: str):
-        # Persist provider explicitly, clear provider-specific voice, refresh voice list, and re-init TTS
         self.cfg["tts_option"] = txt
         self._update_cfg()
         self.cfg["tts_voice"] = ""
@@ -758,20 +796,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_system_tts_enabled()
         self._update_voice_enabled()
         self._reload_voice_list()
-        # Re-init TTS so switching takes effect immediately
         self.tts = TTSManager(self.cfg)
 
     def _on_system_tts_changed(self, txt: str):
-        """Handle changes to the System TTS engine (SAPI5 vs Screen reader/Auto)."""
         self.cfg["system_tts_backend"] = txt
         save_config(self.cfg)
-        # Reinit the TTS backend so the new engine is active
         self.tts = TTSManager(self.cfg)
-        # Reload voice options
         self._update_voice_enabled()
         self._reload_voice_list()
 
-    # ---- Voice list reload & selection ----
     def _reload_voice_list(self):
         self.voice_combo.blockSignals(True)
         self.voice_combo.clear()
@@ -873,7 +906,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.voice_combo.blockSignals(False)
 
     def _update_voice_enabled(self):
-        # Placeholder for future logic; enabling is handled in reload
         pass
 
     def _on_voice_changed(self, display: str):
@@ -883,27 +915,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cfg["tts_voice"] = internal
         save_config(self.cfg)
 
-    # ---- Options ----
     def open_options(self):
         dlg = OptionsDialog(self.cfg, self)
         if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             self.cfg = dlg.get_updated_config()
             save_config(self.cfg)
-            # Apply immediately
             self.tts = TTSManager(self.cfg)
+            self.sound_manager = SoundManager(self.cfg)
             self.summarizer = Summarizer(self.cfg)
             self.system_tts_mode.setCurrentText(self.cfg.get("system_tts_backend", SYSTEM_TTS_ENGINES[0]))
             self._update_system_tts_enabled()
             self._reload_voice_list()
             QtWidgets.QMessageBox.information(self, APP_NAME, "Options saved and applied.")
 
-    # ---- Chat controls ----
     def _on_start(self):
         url = self.url_edit.text().strip()
         vid = extract_youtube_video_id(url)
         if not vid:
             QtWidgets.QMessageBox.warning(self, APP_NAME, "Please enter a valid YouTube live URL or video ID.")
             return
+        self.sound_manager.play("start")
         self.chat_view.append("Starting chat for video: " + vid)
         self.reader = ChatReader(vid)
         self.reader.message_received.connect(self._on_message)
@@ -916,6 +947,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.last_summary_ts = time.time()
 
     def _on_stop(self):
+        self.sound_manager.play("stop")
         if self.reader:
             self.reader.stop()
             self.reader.wait(2000)
@@ -929,11 +961,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
 
-    def _on_message(self, msg: Dict[str, str]):
+    def _on_message(self, msg: Dict[str, Any]):
         author = msg.get("author", "?")
         text = msg.get("text", "")
         self.pending_messages.append(msg)
+        
         if self.chat_mode.currentText() == CHAT_MODES[0]:
+            # Play sounds based on message type
+            msg_type = msg.get("type")
+            if msg_type in ["superChat", "superSticker"]:
+                self.sound_manager.play("donation")
+            elif msg.get("is_moderator"):
+                self.sound_manager.play("moderator")
+            elif msg.get("is_verified"):
+                self.sound_manager.play("verified")
+            else:
+                self.sound_manager.play("chat")
+
             line = f"{author}: {text}"
             self.chat_view.append(line)
             self.tts.speak(line)
@@ -941,14 +985,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.chat_view.append(f"[msg] {author}: {text}")
 
     def _on_error(self, err: str):
+        self.sound_manager.play("error")
         self.chat_view.append(f"[Error] {err}")
-        # Optionally show a non-blocking status message instead of a popup for reconnects
         if "reconnecting" in err.lower() or "connection lost" in err.lower():
             self.statusBar().showMessage(err, 5000)
         else:
             QtWidgets.QMessageBox.warning(self, APP_NAME, err)
 
-    # ---- Quick Summary ----
     def _on_quick_summary(self):
         if not self.pending_messages:
             msg = "No recent messages to summarize."
@@ -958,12 +1001,14 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
             return
+        
+        self.sound_manager.play("summary")
         count = int(self.quick_summary_count_sb.value()) if hasattr(self, "quick_summary_count_sb") else int(self.cfg.get("quick_summary_count", 50))
         recent = self.pending_messages[-count:]
         summary = self.summarizer.summarize(recent)
         self.chat_view.append("[Quick Summary]\n" + summary + "\n")
         try:
-            self.tts.speak("Summary: " + summary)
+            self.tts.speak(summary)
         except Exception:
             pass
 
@@ -971,7 +1016,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cfg["quick_summary_count"] = int(val)
         save_config(self.cfg)
 
-    # ---- TTS Test ----
     def _on_test_tts(self):
         provider = self.cfg.get("tts_option", self.tts_option.currentText())
         engine = self.cfg.get("system_tts_backend", self.system_tts_mode.currentText())
@@ -995,16 +1039,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         mins = max(1, int(self.summary_interval.value()))
         if (time.time() - self.last_summary_ts) >= mins * 60 and self.pending_messages:
+            self.sound_manager.play("summary")
             msgs = self.pending_messages.copy()
             self.pending_messages.clear()
             self.last_summary_ts = time.time()
             summary = self.summarizer.summarize(msgs)
             self.chat_view.append("[Summary]\n" + summary + "\n")
-            self.tts.speak("Summary: " + summary)
+            self.tts.speak(summary)
 
-    # ---- UI helpers ----
     def _update_system_tts_enabled(self):
-        # Currently no extra logic is required, but keep for future enabling/disabling.
         pass
 
 # ----------------- Main entry -----------------
