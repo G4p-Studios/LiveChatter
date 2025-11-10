@@ -1,7 +1,7 @@
 PyQt6
 pytchat
 chat-downloader
-accessible-output2
+accessible-output2==0.16
 sound_lib
 openai
 google-cloud-texttospeech
