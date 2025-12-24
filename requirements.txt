@@ -8,3 +8,4 @@ google-cloud-texttospeech
 boto3
 elevenlabs
 requests
+Nuitka
