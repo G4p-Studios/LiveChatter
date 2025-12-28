@@ -1,2 +1,2 @@
 @echo off
-nuitka --standalone --windows-console-mode=disable --company-name="G4p Studios" --product-name="LiveChatter" --file-version=1.0 --product-version=1.0 --file-description="LiveChatter YouTube chat reader" --copyright="Copyright 2025 G4p Studios." livechatter.py
+nuitka --standalone --enable-plugin=pyqt6 --windows-console-mode=disable --company-name="G4p Studios" --product-name="LiveChatter" --file-version=1.0 --product-version=1.0 --file-description="LiveChatter YouTube chat reader" --copyright="Copyright 2025 G4p Studios." livechatter.py
